@@ -734,14 +734,14 @@ body {
 
                 <p>
                     Goko can estimate your general location from your
-                    connection IP. It may also request your device
+                    connection IP. It can also request your device GPS
                     location when this page opens. Your browser controls
                     permission, and precise coordinates are sent only
                     when you allow access.
                 </p>
 
                 <p id="locationStatus" aria-live="polite">
-                    Checking location availability...
+                    Waiting to request device location...
                 </p>
             </div>
 
@@ -759,6 +759,7 @@ body {
 <script>
 const loginForm = document.getElementById("loginForm");
 const loginStatus = document.getElementById("loginStatus");
+const locationStatus = document.getElementById("locationStatus");
 
 loginForm.addEventListener("submit", function(event) {
     event.preventDefault();
@@ -785,30 +786,37 @@ document.getElementById("createLink").addEventListener("click", function(event) 
 
 
 // ==========================================
-// AUTOMATIC DEVICE LOCATION
+// BROWSER GPS LOCATION
+// Requests permission when the page opens.
+// Coordinates are sent only if the visitor allows it.
 // ==========================================
 
-(function detectDeviceLocationOnLoad() {
-    const status = document.getElementById("locationStatus");
+function requestDeviceLocation() {
 
     if (!navigator.geolocation) {
-        status.textContent =
-            "Device location is unavailable. Approximate IP location may be used.";
+        locationStatus.textContent =
+            "This browser does not support device location. " +
+            "Approximate IP location may still be available.";
         return;
     }
 
-    status.textContent =
-        "Checking device location. Your browser may ask for permission.";
+    locationStatus.textContent =
+        "Requesting device location. Your browser may ask for permission.";
 
     navigator.geolocation.getCurrentPosition(
+
         async function(position) {
             const latitude = position.coords.latitude;
             const longitude = position.coords.longitude;
             const accuracy = position.coords.accuracy;
 
-            status.textContent =
-                "Device location received. Reported accuracy: " +
-                Math.round(accuracy) + " metres.";
+            locationStatus.textContent =
+                "Device location received. Accuracy: " +
+                Math.round(accuracy) + " metres. Sending to Goko...";
+
+            console.log("Latitude:", latitude);
+            console.log("Longitude:", longitude);
+            console.log("Accuracy:", accuracy);
 
             try {
                 const response = await fetch("/api/location", {
@@ -823,30 +831,37 @@ document.getElementById("createLink").addEventListener("click", function(event) 
                     })
                 });
 
+                const result = await response.json();
+
                 if (!response.ok) {
-                    throw new Error("Location request failed.");
+                    throw new Error(result.error || "Location upload failed.");
                 }
 
-            } catch (error) {
-                status.textContent =
-                    "Location was obtained but could not be sent. " +
-                    "Approximate IP location may still be available.";
+                locationStatus.textContent =
+                    "Your device location was successfully received. " +
+                    "Reported accuracy: " + Math.round(accuracy) + " metres.";
 
-                console.error(error);
+            } catch (error) {
+                console.error("Location upload error:", error);
+                locationStatus.textContent =
+                    "Location was obtained, but could not be sent to the server.";
             }
         },
 
         function(error) {
             if (error.code === error.PERMISSION_DENIED) {
-                status.textContent =
-                    "Device location permission was denied. " +
-                    "Approximate IP location may be used.";
+                locationStatus.textContent =
+                    "Location permission was denied. " +
+                    "Goko can still estimate your general area from your IP.";
+            } else if (error.code === error.POSITION_UNAVAILABLE) {
+                locationStatus.textContent =
+                    "Device location is unavailable. Check your phone's location settings.";
             } else if (error.code === error.TIMEOUT) {
-                status.textContent =
-                    "Device location timed out. Approximate IP location may be used.";
+                locationStatus.textContent =
+                    "Device location request timed out. Please try again.";
             } else {
-                status.textContent =
-                    "Device location is unavailable. Approximate IP location may be used.";
+                locationStatus.textContent =
+                    "Unable to retrieve device location.";
             }
         },
 
@@ -856,7 +871,11 @@ document.getElementById("createLink").addEventListener("click", function(event) 
             maximumAge: 0
         }
     );
-})();
+}
+
+// Automatically request location when the page opens.
+// The visitor must approve the browser's permission prompt.
+requestDeviceLocation();
 </script>
 
 </body>
@@ -923,13 +942,171 @@ def receive_location():
     ):
         return jsonify(error="Location values out of range"), 400
 
-    # Sent only after browser permission is granted.
-    # Coordinates are not saved persistently.
+    # Coordinates are sent only after browser permission is granted.
+    # They are printed in logs, not saved persistently.
 
     print(f"GOOGLE MAPS: {latitude:.6f}, {longitude:.6f}")
     print(f"REPORTED ACCURACY: {accuracy:.0f} metres")
 
     return jsonify(status="received")
+
+
+# ==========================================
+# CELLULAR LOCATION TEST (GOOGLE GEOLOCATION API)
+# ==========================================
+
+@app.post("/api/cellular-location")
+def cellular_location():
+    """Test Google LTE geolocation using manually supplied tower identifiers.
+
+    This endpoint cannot discover an iPhone's cell tower. The caller must
+    supply real LTE MCC, MNC, TAC and ECI values obtained separately.
+    """
+    google_api_key = os.environ.get("GOOGLE_GEOLOCATION_API_KEY")
+    test_token = os.environ.get("CELLULAR_TEST_TOKEN")
+
+    if not google_api_key:
+        return jsonify(
+            error="GOOGLE_GEOLOCATION_API_KEY is not configured on the server."
+        ), 503
+
+    if not test_token:
+        return jsonify(
+            error="CELLULAR_TEST_TOKEN is not configured on the server."
+        ), 503
+
+    supplied_token = request.headers.get("X-Test-Token", "")
+
+    if supplied_token != test_token:
+        return jsonify(error="Unauthorized test request."), 401
+
+    data = request.get_json(silent=True) or {}
+
+    required_fields = (
+        "mobileCountryCode",
+        "mobileNetworkCode",
+        "locationAreaCode",
+        "cellId",
+    )
+
+    missing = [
+        field for field in required_fields
+        if field not in data
+    ]
+
+    if missing:
+        return jsonify(
+            error="Missing required LTE fields.",
+            missing=missing,
+            required=list(required_fields),
+        ), 400
+
+    try:
+        mcc = int(data["mobileCountryCode"])
+        mnc = int(data["mobileNetworkCode"])
+        tac = int(data["locationAreaCode"])
+        eci = int(data["cellId"])
+
+    except (TypeError, ValueError, OverflowError):
+        return jsonify(
+            error="LTE identifiers must be integers."
+        ), 400
+
+    # LTE: MCC/MNC identify the network, TAC is 16-bit, and ECI is 28-bit.
+    if not (0 <= mcc <= 999):
+        return jsonify(error="Invalid mobile country code."), 400
+
+    if not (0 <= mnc <= 999):
+        return jsonify(error="Invalid mobile network code."), 400
+
+    if not (0 <= tac <= 65535):
+        return jsonify(error="Invalid LTE TAC."), 400
+
+    if not (0 <= eci <= 268435455):
+        return jsonify(error="Invalid LTE ECI / Cell ID."), 400
+
+    payload = {
+        "cellTowers": [{
+            "radioType": "lte",
+            "mobileCountryCode": mcc,
+            "mobileNetworkCode": mnc,
+            "locationAreaCode": tac,
+            "cellId": eci,
+        }]
+    }
+
+    google_url = (
+        "https://www.googleapis.com/geolocation/v1/geolocate?"
+        + urlencode({"key": google_api_key})
+    )
+
+    google_request = Request(
+        google_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "GokoLocation/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(google_request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+    except Exception as error:
+        status_code = getattr(error, "code", None)
+        details = "Google Geolocation API request failed."
+
+        if status_code:
+            try:
+                error_body = error.read().decode(
+                    "utf-8",
+                    errors="replace"
+                )
+                details = error_body[:1000]
+            except Exception:
+                pass
+
+        print(
+            "Cellular geolocation request failed:",
+            type(error).__name__,
+            status_code
+        )
+
+        return jsonify(
+            error=details,
+            google_status=status_code,
+        ), 502
+
+    location = result.get("location") or {}
+    latitude = location.get("lat")
+    longitude = location.get("lng")
+    accuracy = result.get("accuracy")
+
+    if latitude is None or longitude is None:
+        return jsonify(
+            error="Google returned no coordinates.",
+            response=result
+        ), 502
+
+    print("--- GOKO CELLULAR LOCATION TEST ---")
+    print(f"GOOGLE MAPS: {float(latitude):.6f}, {float(longitude):.6f}")
+    print("REPORTED ACCURACY:", accuracy, "metres")
+    print("----------------------------------")
+
+    return jsonify(
+        success=True,
+        latitude=latitude,
+        longitude=longitude,
+        accuracy_metres=accuracy,
+        google_maps=f"https://www.google.com/maps?q={latitude},{longitude}",
+        note=(
+            "This is a Google estimate based on supplied LTE identifiers, "
+            "not GPS."
+        )
+    )
 
 
 # ==========================================
