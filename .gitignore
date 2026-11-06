@@ -1,0 +1,7 @@
+localhost+2.pem
+localhost+2-key.pem
+tls-keys.log
+__pycache__/
+*.pyc
+.venv/
+.env
