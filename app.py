@@ -10,6 +10,7 @@ import time
 app = Flask(__name__)
 
 IPAPI_KEY = os.environ.get("IPAPI_KEY")
+
 LOCATION_CACHE = {}
 CACHE_SECONDS = 6 * 60 * 60
 MAX_CACHE_ENTRIES = 2000
@@ -49,6 +50,7 @@ def get_ip_location(ip):
         return cached["location"]
 
     params = {"q": ip}
+
     if IPAPI_KEY:
         params["key"] = IPAPI_KEY
 
@@ -157,7 +159,6 @@ HTML = r"""
 :root {
     --bg: #090914;
     --panel: #11111f;
-    --panel-light: #18182b;
     --purple: #9b5cff;
     --purple-light: #c49aff;
     --text: #f7f4ff;
@@ -923,13 +924,10 @@ def receive_location():
     ):
         return jsonify(error="Location values out of range"), 400
 
-    # Received only after browser permission is granted.
-    # Coordinates are logged for this request, not saved persistently.
-    print("\n--- GOKO DEVICE LOCATION ---")
-    print(f"Latitude: {latitude:.6f}")
-    print(f"Longitude: {longitude:.6f}")
-    print(f"Reported accuracy: {accuracy:.0f} metres")
-    print("----------------------------\n")
+    # Sent only after browser permission is granted.
+    # Coordinates are not saved persistently.
+
+    print(f"GOOGLE MAPS: {latitude:.6f}, {longitude:.6f}")
 
     return jsonify(status="received")
 
