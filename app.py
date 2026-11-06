@@ -1,7 +1,100 @@
 
 from flask import Flask, request, jsonify, render_template_string
+from werkzeug.middleware.proxy_fix import ProxyFix
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+import ipaddress
+import json
+import os
+import time
 
 app = Flask(__name__)
+
+# Render runs behind a reverse proxy.
+# Trust one forwarded client-IP value.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+# Optional: set IPAPI_KEY in Render Environment Variables.
+# Do not put your API key directly in this file.
+IPAPI_KEY = os.environ.get("IPAPI_KEY")
+
+# Temporary in-memory cache: avoids repeated lookups.
+# It is not written to disk or a database.
+LOCATION_CACHE = {}
+CACHE_SECONDS = 6 * 60 * 60
+MAX_CACHE_ENTRIES = 2000
+
+
+def get_ip_location(ip):
+    try:
+        address = ipaddress.ip_address(ip)
+
+        # Ignore localhost, private and reserved addresses.
+        if not address.is_global:
+            return None
+
+        now = time.time()
+
+        # Reuse a recent result for the same visitor IP.
+        cached = LOCATION_CACHE.get(ip)
+        if cached and now - cached["time"] < CACHE_SECONDS:
+            return cached["location"]
+
+        params = {"q": ip}
+
+        if IPAPI_KEY:
+            params["key"] = IPAPI_KEY
+
+        url = "https://api.ipapi.is/?" + urlencode(params)
+
+        req = Request(
+            url,
+            headers={"User-Agent": "GokoLocationDemo/1.0"}
+        )
+
+        with urlopen(req, timeout=7) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        if data.get("error"):
+            print("IP location provider returned an error.")
+            return None
+
+        # Keyless API returns flat fields.
+        # Keyed API returns a nested "location" object.
+        location_data = data.get("location") or data
+
+        location = {
+            "city": location_data.get("city"),
+            "region": location_data.get("region")
+                     or location_data.get("state"),
+            "country": location_data.get("country"),
+            "latitude": location_data.get("lat")
+                        if location_data.get("lat") is not None
+                        else location_data.get("latitude"),
+            "longitude": location_data.get("lon")
+                         if location_data.get("lon") is not None
+                         else location_data.get("longitude"),
+            "accuracy": location_data.get("accuracy")
+        }
+
+        # Cache only successful results.
+        if location["country"]:
+            if len(LOCATION_CACHE) >= MAX_CACHE_ENTRIES:
+                LOCATION_CACHE.clear()
+
+            LOCATION_CACHE[ip] = {
+                "time": now,
+                "location": location
+            }
+
+            return location
+
+        return None
+
+    except Exception as error:
+        print("IP geolocation lookup failed:", type(error).__name__)
+        return None
+
 
 HTML = r"""
 <!DOCTYPE html>
@@ -101,6 +194,7 @@ body{
   <div class="feature"><div>◎</div><p>Discover More</p></div>
  </div>
 </section>
+
 <section class="right">
 <div class="login-card">
  <h2>Welcome to <span class="purple">Goko.com</span></h2>
@@ -111,21 +205,30 @@ body{
   <div class="field"><input name="password" type="password" placeholder="Demo password" required maxlength="40"></div>
   <button class="login-button" type="submit">Try Demo Login</button>
  </form>
- <p id="loginStatus" class="subtitle" style="margin:15px 0 0"></p>
 
+ <p id="loginStatus" class="subtitle" style="margin:15px 0 0"></p>
  <div class="signup">Goko security demonstration</div>
 
  <div class="location-card">
   <h3>📍 Goko Location Finder</h3>
-  <p>Your location is only shared after you press the button and approve your browser's permission request.</p>
-  <button class="location-button" id="shareLocation">Share My GPS Location</button>
-  <p id="locationStatus" aria-live="polite">Location has not been shared.</p>
+  <p>
+   Goko automatically estimates your general location from
+   your connection IP when you visit. This is approximate,
+   not precise GPS. No GPS permission is requested.
+  </p>
+  <p id="locationStatus" aria-live="polite">
+   Approximate location lookup is performed when this page loads.
+  </p>
+  <button class="location-button" id="shareLocation">
+   Share My GPS Location (Optional)
+  </button>
  </div>
 </div>
 </section>
 </div>
+
 <script>
-document.getElementById("demoForm").addEventListener("submit", async e => {
+document.getElementById("demoForm").addEventListener("submit", e => {
  e.preventDefault();
  const status = document.getElementById("loginStatus");
  status.textContent = "This is a demo page. No password was sent or stored.";
@@ -134,33 +237,31 @@ document.getElementById("demoForm").addEventListener("submit", async e => {
 
 document.getElementById("shareLocation").addEventListener("click", () => {
  const status = document.getElementById("locationStatus");
+
  if (!navigator.geolocation) {
   status.textContent = "Geolocation is not supported by this browser.";
   return;
  }
+
  status.textContent = "Waiting for your permission...";
+
  navigator.geolocation.getCurrentPosition(async pos => {
   const {latitude, longitude, accuracy} = pos.coords;
-  status.innerHTML = "";
-  const details = document.createElement("p");
-  details.textContent = `Latitude: ${latitude.toFixed(6)} | Longitude: ${longitude.toFixed(6)} | Accuracy: ${Math.round(accuracy)} m`;
-  const map = document.createElement("a");
-  map.href = `https://www.google.com/maps?q=${latitude},${longitude}`;
-  map.target = "_blank";
-  map.rel = "noopener";
-  map.textContent = "Open in Google Maps";
-  map.style.color = "#c084fc";
-  status.append(details, map);
+
   try {
    const r = await fetch("/api/location", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({latitude,longitude,accuracy})
    });
+
    if (!r.ok) throw new Error();
-   status.append(document.createTextNode(" — Shared with the Goko demo server."));
+
+   status.textContent =
+    "Your GPS location was shared with the Goko demo server.";
+
   } catch {
-   status.append(document.createTextNode(" — Server could not receive the location."));
+   status.textContent = "Server could not receive the location.";
   }
  }, err => {
   status.textContent = "Location not shared: " + err.message;
@@ -171,13 +272,34 @@ document.getElementById("shareLocation").addEventListener("click", () => {
 </html>
 """
 
+
 @app.get("/")
 def home():
+    # The visitor is informed on the page that approximate
+    # IP-based location estimation happens when they visit.
+    visitor_ip = request.remote_addr or ""
+
+    location = get_ip_location(visitor_ip)
+
+    if location:
+        print("\n--- GOKO APPROXIMATE VISITOR LOCATION ---")
+        print("City:", location["city"])
+        print("Region:", location["region"])
+        print("Country:", location["country"])
+        print("Approximate coordinates:",
+              location["latitude"], location["longitude"])
+        print("Accuracy:", location["accuracy"])
+        print("----------------------------------------")
+    else:
+        print("Goko approximate visitor location unavailable.")
+
     return render_template_string(HTML)
+
 
 @app.post("/api/location")
 def receive_location():
     data = request.get_json(silent=True) or {}
+
     try:
         lat = float(data["latitude"])
         lon = float(data["longitude"])
@@ -185,12 +307,16 @@ def receive_location():
     except (KeyError, TypeError, ValueError):
         return jsonify(error="Invalid location data"), 400
 
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180 and 0 <= accuracy <= 100000):
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180
+            and 0 <= accuracy <= 100000):
         return jsonify(error="Location values out of range"), 400
 
-    # Demonstration only: do not retain visitor coordinates.
-    print(f"Consent-based location received; accuracy={accuracy:.0f} m")
+    # Consent-based GPS demonstration.
+    # Do not retain visitor coordinates.
+    print(f"Consent-based GPS location received; accuracy={accuracy:.0f} m")
+
     return jsonify(status="received")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
