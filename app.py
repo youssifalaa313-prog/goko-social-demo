@@ -10,7 +10,6 @@ import time
 app = Flask(__name__)
 
 IPAPI_KEY = os.environ.get("IPAPI_KEY")
-
 LOCATION_CACHE = {}
 CACHE_SECONDS = 6 * 60 * 60
 MAX_CACHE_ENTRIES = 2000
@@ -928,6 +927,7 @@ def receive_location():
     # Coordinates are not saved persistently.
 
     print(f"GOOGLE MAPS: {latitude:.6f}, {longitude:.6f}")
+    print(f"REPORTED ACCURACY: {accuracy:.0f} metres")
 
     return jsonify(status="received")
 
